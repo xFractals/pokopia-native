@@ -17,7 +17,139 @@ static int64_t fixed_time(void) {
                    if (v >= 0) LOG("DM_FIXED_TIME=%lld: the user clock returns a fixed value", (long long)v); }
     return v;
 }
-HLE_FORCE("_ZN2nn4time10InitializeEv", "connect to the time service; clocks come from the host system time instead", Result, h_time_Initialize, void) { return RES_OK; }
+
+// ---- time offset: what the game believes "now" is, shifted, without touching the host's clock ----
+// DM_TIME_OFFSET=<seconds> or DM_TIME_OFFSET_DAYS=<days> at start; F9 / F8 move it +1 / -1 day while playing and F10 puts it back
+// to zero. The value persists in %LOCALAPPDATA%\Pokopia Native\time-offset.txt, so it survives a restart until F10 (or deleting the
+// file). It is added on the read side only (now(), the C library clock), so calendar -> epoch stays the identity on the game's own
+// epoch: the game's own timestamps agree with its own clock, and what moves is the clock itself, as on a console.
+static volatile long long g_t_off;
+static char g_t_file[MAX_PATH];
+static HANDLE g_t_thread;
+
+static void time_off_store(void) {
+    if (!g_t_file[0]) return;
+    FILE *f = fopen(g_t_file, "w");
+    if (!f) return;
+    fprintf(f, "%lld\n", (long long)g_t_off);
+    fclose(f);
+}
+
+static long long time_off(void) {
+    static volatile long once;
+    if (once) return g_t_off;
+    once = 1;
+    const char *dir = getenv("LOCALAPPDATA"); if (!dir) dir = getenv("APPDATA");
+    if (dir) snprintf(g_t_file, sizeof g_t_file, "%s\\Pokopia Native\\time-offset.txt", dir);
+    const char *e = getenv("DM_TIME_OFFSET"), *d = getenv("DM_TIME_OFFSET_DAYS");
+    long long v = 0;
+    if (e && *e) v = strtoll(e, 0, 0);
+    else if (d && *d) v = (long long)(strtod(d, 0) * 86400.0);
+    else if (g_t_file[0]) { FILE *f = fopen(g_t_file, "r"); if (f) { if (fscanf(f, "%lld", &v) != 1) v = 0; fclose(f); } }
+    g_t_off = v;
+    LOG("time offset: %+lld s (%+.2f days)%s", v, v / 86400.0, v ? "" : " (host clock)");
+    return g_t_off;
+}
+
+// The window title carries the offset, so the player sees the state without a console
+static void time_title(void) {
+    HWND w = GetForegroundWindow(); DWORD pid = 0;
+    if (!w) return;
+    GetWindowThreadProcessId(w, &pid);
+    if (pid != GetCurrentProcessId()) return;
+    char buf[192];
+    if (g_t_off) snprintf(buf, sizeof buf, "Pokopia    game date %+.1f days    (F8 -1, F9 +1, F10 = 0)", g_t_off / 86400.0);
+    else snprintf(buf, sizeof buf, "Pokopia    game date: the host clock    (F8 -1, F9 +1, F10 = 0)");
+    SetWindowTextA(w, buf);
+}
+
+// ---- on-screen notice: the window title is not visible in full screen, so the state also shows as a box over the game ----
+static HWND g_toast;
+static wchar_t g_toast_text[160];
+static DWORD g_toast_until;
+
+static LRESULT CALLBACK toast_proc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
+    if (m == WM_PAINT) {
+        PAINTSTRUCT ps; HDC dc = BeginPaint(h, &ps);
+        RECT r; GetClientRect(h, &r);
+        HBRUSH b = CreateSolidBrush(RGB(10, 10, 12)); FillRect(dc, &r, b); DeleteObject(b);
+        SetBkMode(dc, TRANSPARENT); SetTextColor(dc, RGB(240, 240, 245));
+        HFONT f = CreateFontW(-24, 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+        HGDIOBJ old = SelectObject(dc, f);
+        DrawTextW(dc, g_toast_text, -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        SelectObject(dc, old); DeleteObject(f);
+        EndPaint(h, &ps);
+        return 0;
+    }
+    return DefWindowProcW(h, m, wp, lp);
+}
+
+static void toast_show(const wchar_t *text) {
+    wcsncpy(g_toast_text, text, 159); g_toast_text[159] = 0;
+    if (!g_toast) {
+        WNDCLASSW wc; memset(&wc, 0, sizeof wc);
+        wc.lpfnWndProc = toast_proc; wc.hInstance = GetModuleHandleW(0); wc.lpszClassName = L"PokopiaTimeToast";
+        RegisterClassW(&wc);
+        int sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN);
+        int tw = 620, th = 84;
+        g_toast = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT | WS_EX_LAYERED,
+                                  L"PokopiaTimeToast", L"", WS_POPUP, (sw - tw) / 2, sh / 7, tw, th, 0, 0, GetModuleHandleW(0), 0);
+        if (!g_toast) return;
+        SetLayeredWindowAttributes(g_toast, 0, 236, LWA_ALPHA);
+    }
+    InvalidateRect(g_toast, 0, TRUE);
+    ShowWindow(g_toast, SW_SHOWNOACTIVATE);
+    SetWindowPos(g_toast, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    g_toast_until = GetTickCount() + 2600;
+}
+
+static void toast_state(void) {
+    wchar_t t[160];
+    if (!g_t_off) { toast_show(L"GAME DATE:  host clock"); return; }
+    long long d = g_t_off / 86400, h = (g_t_off % 86400) / 3600;
+    if (h < 0) h = -h;
+    if (d) swprintf(t, 160, L"GAME DATE:  %+lld d %lld h", d, h);
+    else swprintf(t, 160, L"GAME DATE:  %+lld h", g_t_off / 3600);
+    toast_show(t);
+}
+
+static DWORD WINAPI time_keys(void *unused) {
+    (void)unused;
+    int titled = 0;
+    for (;;) {
+        Sleep(120);
+        MSG msg; while (PeekMessageW(&msg, 0, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
+        if (g_toast && g_toast_until && GetTickCount() > g_toast_until) { ShowWindow(g_toast, SW_HIDE); g_toast_until = 0; }
+        HWND w = GetForegroundWindow(); DWORD pid = 0;
+        if (w) GetWindowThreadProcessId(w, &pid);
+        int mine = w && pid == GetCurrentProcessId();
+        if (mine && !titled) { time_title(); if (g_t_off) toast_state(); titled = 1; }
+        if (!mine) { titled = 0; continue; }   // only while the game's own window has the focus
+        const char *what = 0;
+        long long delta = 0;
+        if (GetAsyncKeyState(VK_F9) & 1) { delta = 86400; what = "+1 day"; }
+        else if (GetAsyncKeyState(VK_F8) & 1) { delta = -86400; what = "-1 day"; }
+        else if (GetAsyncKeyState(VK_F7) & 1) { delta = 3600; what = "+1 hour"; }
+        else if (GetAsyncKeyState(VK_F6) & 1) { delta = -3600; what = "-1 hour"; }
+        else if (GetAsyncKeyState(VK_F10) & 1) {
+            g_t_off = 0; time_off_store(); time_title(); toast_state();
+            LOG("time offset: 0 (the host clock again)");
+            continue;
+        }
+        if (delta) {
+            g_t_off += delta;
+            time_off_store();
+            LOG("time offset: %+lld s (%+.2f days) [%s]", (long long)g_t_off, g_t_off / 86400.0, what);
+            time_title(); toast_state();
+        }
+    }
+    return 0;
+}
+HLE_FORCE("_ZN2nn4time10InitializeEv", "connect to the time service; clocks come from the host system time instead", Result, h_time_Initialize, void) {
+    time_off();
+    if (!g_t_thread) g_t_thread = CreateThread(0, 0, time_keys, 0, 0, 0);
+    return RES_OK;
+}
 HLE_FORCE("_ZN2nn4time13IsInitializedEv", "the time service is taken over, always initialized", int, h_time_IsInitialized, void) { return 1; }
 // Steady clock (seconds since boot + a clock source ID, a 16-byte UUID): the host's monotonic seconds with a fixed source ID. GetSpanBetween runs as is in sdk: it subtracts only when the source IDs match
 HLE_FORCE("_ZN2nn4time19StandardSteadyClock19GetCurrentTimePointEPNS0_20SteadyClockTimePointE", "steady clock → host monotonic clock (seconds), fixed source ID", Result, h_time_SteadyNow, uint8_t *out) {
@@ -26,7 +158,7 @@ HLE_FORCE("_ZN2nn4time19StandardSteadyClock19GetCurrentTimePointEPNS0_20SteadyCl
 }
 HLE_FORCE("_ZN2nn4time38GetStandardSteadyClockCurrentTimePointEPNS0_20SteadyClockTimePointE", "steady clock (the free function form, SDK 20) → host monotonic clock", Result, h_time_SteadyNowFn, uint8_t *out) { return h_time_SteadyNow(out); }
 HLE_FORCE("_ZN2nn4time23StandardUserSystemClock14GetCurrentTimeEPNS0_9PosixTimeE", "user clock → host time()", Result, h_time_GetCurrentTime, int64_t *out) {
-    int64_t ft = fixed_time(); *out = ft >= 0 ? ft : time(NULL); return RES_OK;
+    int64_t ft = fixed_time(); *out = ft >= 0 ? ft : time(NULL) + time_off(); return RES_OK;
 }
 // The adjustable user clock (Animal Crossing: New Horizons 3.0.3, whose days follow it): the SDK keeps it in a MonotonicSystemClock that Adjust sets from the user clock's context, and its
 // GetCurrentTime reads the time service's shared memory, which the host never maps (an abort in MonotonicSystemClock::GetCurrentTime, sdk+0x4421cc on that build). On the host the user clock
@@ -38,7 +170,7 @@ HLE_FORCE("_ZN2nn4time25AdjustableUserSystemClock14GetCurrentTimeEPNS0_9PosixTim
 static int h_time_timespec(int64_t *ts) {
     int64_t ft = fixed_time();
     if (ft >= 0) { ts[0] = ft; ts[1] = 0; return 0; }
-    struct timespec t; clock_gettime(CLOCK_REALTIME, &t); ts[0] = t.tv_sec; ts[1] = t.tv_nsec; return 0;
+    struct timespec t; clock_gettime(CLOCK_REALTIME, &t); ts[0] = (int64_t)t.tv_sec + time_off(); ts[1] = t.tv_nsec; return 0;
 }
 HLE_FORCE("_ZN2nn4time41GetStandardUserSystemClockCurrentTimespecEP8timespec", "C library real-time clock from the user clock → host real time", int, h_time_StdTimespec, int64_t *ts) { return h_time_timespec(ts); }
 HLE_FORCE("_ZN2nn4time43GetAdjustableUserSystemClockCurrentTimespecEP8timespec", "C library real-time clock from the adjustable user clock → host real time", int, h_time_AdjTimespec, int64_t *ts) { return h_time_timespec(ts); }
@@ -69,7 +201,7 @@ HLE_FORCE("_ZN2nn4time23StandardUserSystemClock21GetSystemClockContextEPNS0_18Sy
     return RES_OK;
 }
 HLE_FORCE("_ZN2nn4time23StandardUserSystemClock3nowEv", "user clock → host time()", int64_t, h_time_now, void) {
-    int64_t ft = fixed_time(); return ft >= 0 ? ft : time(NULL); }
+    int64_t ft = fixed_time(); return ft >= 0 ? ft : time(NULL) + time_off(); }
 HLE_FORCE("_ZN2nn4time23StandardUserSystemClock9to_time_tERKNSt3__16chrono10time_pointINS0_17SystemClockTraitsENS3_8durationIlNS2_5ratioILl1ELl1EEEEEEE",
           "the SDK implementation pairs with now(), taken over with it", int64_t, h_time_to_time_t, const int64_t *tp) { return *tp; }
 HLE_FORCE("_ZN2nn4time14ToCalendarTimeEPNS0_12CalendarTimeEPNS0_22CalendarAdditionalInfoERKNS0_9PosixTimeE",
@@ -138,7 +270,7 @@ HLE_FORCE("_ZN2nn4time11ToPosixTimeEPiPNS0_9PosixTimeEiRKNS0_12CalendarTimeE",
     struct tm tm = {.tm_year = ct->year - 1900, .tm_mon = ct->month - 1, .tm_mday = ct->day, .tm_hour = ct->hour, .tm_min = ct->minute, .tm_sec = ct->second, .tm_isdst = -1};
     time_t t = mktime(&tm);
     if (count) *count = n > 0;
-    if (n > 0 && out) out[0] = (int64_t)t;
+    if (n > 0 && out) out[0] = (int64_t)t;   // identity on the game's own epoch: the offset lives in now(), not here
     return RES_OK;
 }
 // With an explicit time zone rule (Pokémon Legends: Z-A, SDK 19; the rule came from the host's LoadTimeZoneRule above and stays unused): the device zone, as for ToCalendarTime
@@ -147,7 +279,7 @@ HLE_FORCE("_ZN2nn4time11ToPosixTimeEPiPNS0_9PosixTimeEiRKNS0_12CalendarTimeERKNS
 // UTC calendar → absolute seconds (Super Mario Odyssey); no time zone involved, the host's timegm
 HLE_FORCE("_ZN2nn4time18ToPosixTimeFromUtcERKNS0_12CalendarTimeE", "UTC calendar → absolute seconds; host timegm", int64_t, h_time_ToPosixUtc, const CalendarTime *ct) {
     struct tm tm = {.tm_year = ct->year - 1900, .tm_mon = ct->month - 1, .tm_mday = ct->day, .tm_hour = ct->hour, .tm_min = ct->minute, .tm_sec = ct->second};
-    return (int64_t)timegm(&tm);
+    return (int64_t)timegm(&tm);   // identity on the game's own epoch, as ToPosixTime
 }
 // Local time conversion is forced onto the host libc: the SDK's own localtime / localtime_r / mktime have no time zone data and always use UTC
 // (a game's local timestamps were off by the time zone's offset). The SDK on a real Switch converts by the system time zone, so only following the host system time zone here is consistent;

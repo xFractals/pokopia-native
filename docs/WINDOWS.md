@@ -75,6 +75,11 @@ Double-click **`<build folder>\out\Play Pokopia <version>.cmd`** (or **Play** in
   their own layout.
 - **Controllers:** Xbox, PlayStation and Switch Pro controllers work as Switch controllers (face buttons by position),
   with rumble and motion. Close Steam or turn off Steam Input for the controller if it does not show up.
+- **The game's clock:** the game reads Windows' clock, so a build that takes days takes days. While the game window has the focus,
+  **F9** / **F8** move the game's date a day on or back, **F7** / **F6** an hour, and **F10** puts it back to the PC's own; a notice over
+  the game and its title bar show where the clock is. Windows' clock is never touched, and the shift is kept in
+  `%LOCALAPPDATA%\Pokopia Native\time-offset.txt` until F10 (`DM_TIME_OFFSET`, `DM_TIME_OFFSET_DAYS`:
+  [docs/time-offset.md](../windows/docs/time-offset.md)).
 - **Typing (your name, for one):** a small box opens over the game. Type and press Enter, or with only a controller
   press A, B or + to accept it (an empty box becomes "Player"; the game won't let you change your name later, so a
   keyboard is best for this one).
